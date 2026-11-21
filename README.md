@@ -2,6 +2,8 @@
 
 This repository contains the JavaScript helper functions used by SSMCP code mode. Functions such as `exec.run`, `tools.search`, `say`, `ui.wait`, `messages.send`, and `workers.submit` are editable source in `tools.js`. They call SSMCP's authenticated host operations; editing a helper does not grant additional permissions.
 
+**Integration status:** the companion SSMCP client loader, RC, `tool_client_id`, and `ssmcp tools` commands described below are being implemented on the release work branch. They are not available in the published 0.10.25 client. This repository defines the source contract; publishing it alone does not install or validate that client integration.
+
 ## Source contract
 
 `manifest.json` names one UTF-8 JavaScript entry file. The file evaluates to a synchronous factory accepting `core` and returning named helper exports. SSMCP evaluates it in the same bounded VM as the user's code, without Node.js imports, filesystem access, network access, or dynamic code generation. Top-level factories define helpers; they must not start native operations.
