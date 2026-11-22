@@ -152,6 +152,37 @@ test('saved output rejects same-length content changes despite consistent page m
   assert.equal(calls[0].name, 'ssmcp.output.read');
 });
 
+test('saved output rejects malformed UTF-8 before digest without losing its receipt or cursor', async () => {
+  for (const [name, invalid, atEnd] of [
+    ['overlong', [0xc0, 0xaf], false],
+    ['isolated continuation', [0x80], false],
+    ['UTF-8 surrogate', [0xed, 0xa0, 0x80], false],
+    ['truncated sequence', [0xe4, 0xb8], true],
+  ]) {
+    const saved = spilled(mcp({text:'UTF8_PLACEHOLDER'}));
+    const offset = atEnd ? saved.bytes.length - invalid.length : saved.bytes.indexOf('UTF8_PLACEHOLDER');
+    assert.ok(offset >= 0);
+    Buffer.from(invalid).copy(saved.bytes, offset);
+    const receipt = saved.receipt.structuredContent;
+    saved.receipt = mcp({...receipt, artifact:{...receipt.artifact, sha256:sha256(saved.bytes)}});
+    let digests = 0;
+    const {sdk, calls} = fixture((tool, args) => saved.read(args), [], {
+      digest:value => {digests++; return sha256(value);},
+    });
+    await assert.rejects(sdk.outputs.result('pool', saved.receipt), error => {
+      assert.match(error.message, /not complete UTF-8/, name);
+      assert.equal(error.recovery.complete, false);
+      assert.equal(error.recovery.next_offset, saved.bytes.length);
+      assert.equal(error.recovery.pages, 1);
+      assert.deepEqual(plain(error.native_result), saved.receipt);
+      return true;
+    });
+    assert.equal(digests, 0, name);
+    assert.equal(calls.length, 1, name);
+    assert.equal(calls[0].name, 'ssmcp.output.read');
+  }
+});
+
 test('saved output fails explicitly when runtime SHA-256 support is unavailable or asynchronous', async () => {
   for (const digest of [undefined, () => '', () => Promise.resolve('0'.repeat(64)),
     () => {throw new Error('runtime digest unavailable');}]) {

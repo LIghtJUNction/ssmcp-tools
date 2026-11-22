@@ -347,15 +347,37 @@
       throw new Failure('output page contains invalid base64');
     }
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    let result = '';
+    // Flatten small blocks instead of retaining one concatenation node per byte.
+    const parts = [], bytes = [];
     for (let i = 0; i < encoded.length; i += 4) {
       const a = alphabet.indexOf(encoded[i]), b = alphabet.indexOf(encoded[i + 1]);
       const c = alphabet.indexOf(encoded[i + 2]), d = alphabet.indexOf(encoded[i + 3]);
-      result += String.fromCharCode((a << 2) | (b >> 4));
-      if (c >= 0) result += String.fromCharCode(((b & 15) << 4) | (c >> 2));
-      if (d >= 0) result += String.fromCharCode(((c & 3) << 6) | d);
+      bytes.push((a << 2) | (b >> 4));
+      if (c >= 0) bytes.push(((b & 15) << 4) | (c >> 2));
+      if (d >= 0) bytes.push(((c & 3) << 6) | d);
+      if (bytes.length >= 1023) {
+        parts.push(String.fromCharCode(...bytes));
+        bytes.length = 0;
+      }
     }
-    return result;
+    if (bytes.length) parts.push(String.fromCharCode(...bytes));
+    return parts.join('');
+  };
+  const decodeOutputText = chunks => {
+    const hex = Array.from({length:256}, (_, byte) => '%' + byte.toString(16).padStart(2, '0'));
+    const parts = [], escaped = [];
+    for (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i++) {
+        escaped.push(hex[chunk.charCodeAt(i)]);
+        if (escaped.length === 4096) {
+          parts.push(escaped.join(''));
+          escaped.length = 0;
+        }
+      }
+    }
+    if (escaped.length) parts.push(escaped.join(''));
+    // One strict decode preserves UTF-8 sequences across both page and block boundaries.
+    return decodeURIComponent(parts.join(''));
   };
   const resolveOutput = async (id, reply, budget = {remaining:120}) => {
     const receipt = reply?.structuredContent;
@@ -416,10 +438,7 @@
     }
     let decoded;
     try {
-      // Decode once: a UTF-8 character may straddle any native byte page.
-      const escaped = chunks.join('').replace(/[\s\S]/gu,
-        byte => '%' + byte.charCodeAt(0).toString(16).padStart(2, '0'));
-      decoded = decodeURIComponent(escaped);
+      decoded = decodeOutputText(chunks);
     } catch { throw fail('Saved output is not complete UTF-8'); }
     let actualHash;
     try { actualHash = digest(decoded); }

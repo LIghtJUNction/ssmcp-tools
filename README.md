@@ -183,7 +183,7 @@ metadata object is never returned as a task result.
 Run the focused contracts with:
 
 ```sh
-node --test tests/live-events.test.cjs tests/workers.test.cjs
+node --test tests/live-events.test.cjs tests/workers.test.cjs tests/output-memory.test.cjs
 ```
 
 Publishing a reviewed Git commit and updating a client's clean official checkout
