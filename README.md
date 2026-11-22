@@ -68,6 +68,129 @@ Run the focused helper contract checks with:
 node --test tests/live-events.test.cjs
 ```
 
+## Worker tasks and bounded waits
+
+`workers.status`, `attach`, `submit`, `tasks`, `result`, `cancel`, `stop`, and
+`resize` call the corresponding
+`ssmcp.worker.*` tools with the current authenticated binding. External workers
+also have `wait`, `claim`, `complete`, `report`, and `release` helpers. Arguments
+are forwarded unchanged; native schemas and ownership checks remain authoritative.
+These helpers do not start models, switch identities, or automatically repeat a
+submission. A manager can submit once and wait for that exact task:
+
+```js
+const accepted = await workers.submit(poolId, {
+  request_id: "build-request-1",
+  text: "Run the assigned checks and report their actual outcome.",
+});
+return await workers.waitResult(poolId, {
+  task_id: accepted.task.task_id,
+  timeout_ms: 20000,
+});
+```
+
+`waitResult` accepts `timeout_ms` from 0 to 25000, default 20000. It uses bounded
+native `worker.result` waits of at most 5000 ms each. It returns
+`{result: <native result view>, wait: <observation metadata>}`. The actual
+`result.task.status` remains `queued`, `working`, `cancelling`, `completed`, `failed`, `cancelled`,
+or `unknown`. The separate `wait` object reports `reason`, `timed_out`, and
+`elapsed_ms`. Terminal observations and `cancelling` stop further waits.
+`unknown` preserves the native `replay_safe` value and never triggers resubmission.
+A waiting deadline does not cancel a task or make a working task fail. Resume by
+observing the same task ID. The time setting bounds requested native waiting;
+network calls and result recovery can add latency, so keep the enclosing
+code-mode deadline longer. Call and iteration budgets also stop observation with
+the last actual task state, identified by `call_budget` or `wait_budget`.
+
+An external worker retains its original `request_id` when retrying `workers.wait`
+after a lost response. Preserve the returned claim unchanged for `complete`, then
+use a new wait ID. Retirement requires the exact native retirement receipt.
+
+### Pool availability events
+
+`workers.waitAvailable(poolId, {after?, wait_ms?})` discovers the selected client's
+`ssmcp.worker.wait_available` and forwards the arguments exactly once when its
+generation/revision schema is advertised. Discover its current schema before choosing arguments.
+There is no periodic polling fallback. Missing support raises
+`WORKER_EVENT_WAIT_UNAVAILABLE`. If bounded discovery ends before finding the tool,
+an incomplete catalog remains a discovery error.
+
+The inspected client 0.10.27 registry does **not** advertise this primitive. The
+inspected relay 0.10.26 await targets are `exec`, `job`, `agent_status`,
+`agent_messages`, and `user_input`; an agent presence status does not establish
+worker-pool capacity. Updating this JavaScript repository alone therefore cannot
+provide pool event wakeups on those versions.
+
+The [native source contract at 9902b88](https://github.com/LIghtJUNction/ssmcp/blob/9902b88c8d48639cbe5e0effacbd0877e55be174/src/worker/pool.rs)
+implements a wait on capacity revisions under the existing manager binding.
+Omit `after` for an immediate snapshot; pass its exact `{generation, revision}`
+to wait up to 5000 ms for a change. The native statuses are `current`, `changed`,
+`unchanged`, and `not_accepting`. A change is an observation, not a reservation
+or proof that an idle worker now exists: inspect `availability.accepting` and
+`availability.idle_slots` before scheduling. Progress logs do not advance this
+capacity revision. Stale generations remain native errors.
+
+```js
+const current = await workers.waitAvailable(poolId, {wait_ms: 0});
+const {generation, revision} = current.availability;
+return await workers.waitAvailable(poolId, {
+  after: {generation, revision},
+  wait_ms: 5000,
+});
+```
+
+The helper's contract fixtures use that pinned schema. Native event execution
+still needs a client build exposing it; these JS tests are not native lifecycle
+tests. As a temporary coordination channel, a worker can send its manager an
+explicit collaboration message after completing a claim and entering idle.
+The manager can await that inbox event, then verify the actual pool receipt;
+the message alone does not establish available capacity.
+
+### Recovering saved results
+
+Worker helpers automatically recover `mcp_tool_result_json` spill receipts before
+reading task data. The concise result preserves complete tasks, prompts, outputs,
+errors, claims, retirement receipts, cancellation flags, and task-page cursors.
+Only repeated `worker.slots[].logs` arrays are omitted; `logs_omitted` gives their
+count and `next_log_sequence` remains unchanged. `tasks` preserves its native
+`page.tasks` and `page.next_cursor` for subsequent pages.
+
+For an unchanged full MCP payload, including monitor logs:
+
+```js
+const receipt = await call(poolId, "ssmcp.worker.status", {});
+const recovered = await outputs.result(poolId, receipt);
+if (recovered.isError) return recovered;
+return recovered.structuredContent;
+```
+
+Recovery reads immutable complete artifacts in 4096-byte pages, at most four
+concurrently, and decodes UTF-8 after joining the exact base64 bytes. It checks
+page sizes, offsets, completeness, truncation, and EOF. `recovered_output` retains
+the artifact receipt and verified byte/page progress; worker views expose it as
+`_output`. Before parsing, recovery verifies the strictly decoded original UTF-8
+JSON text against the receipt's 64-character lowercase SHA-256. A missing or
+invalid synchronous runtime digest, or a hash mismatch, fails recovery without
+returning an unverified result.
+The recovery limit is 480 KiB and 120 native calls per helper operation; a bounded
+wait shares that budget across its observations. Larger or incomplete artifacts,
+invalid JSON, failed reads, and native errors remain errors. Recovery failures
+retain `native_result` and `recovery` with the original artifact and exact
+`next_offset`; use explicit `outputs.read` if a larger capture is needed. A spill
+metadata object is never returned as a task result.
+
+Run the focused contracts with:
+
+```sh
+node --test tests/live-events.test.cjs tests/workers.test.cjs
+```
+
+Publishing a reviewed Git commit and updating a client's clean official checkout
+with `ssmcp tools update` are separate steps. Once the source is updated, the next
+selected-client code-mode run interprets it; these helpers need no Rust rebuild
+or active-session reload. Check that run's tool-source receipt to identify the
+loaded commit and hash. New native event primitives still require native support.
+
 ## License and origin
 
 MIT. The initial helpers were extracted from the SSMCP code-mode API, retaining their behavior and host dispatch boundaries. Runtime validation results belong to the exact SSMCP source and tool-source revisions used in that run.

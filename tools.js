@@ -332,10 +332,118 @@
     ['list', 'status', 'create', 'restart', 'close'].map(name =>
       [name, (id, args = {}) => workspaceResult(id, 'ssmcp.session.' + name, args)])
   ));
+  // A large native reply is a receipt for saved MCP JSON, not the tool result.
+  // Use small pages so reading that receipt cannot itself spill another reply.
+  const outputFailure = (message, reply, recovery) => {
+    const error = new Failure(message);
+    error.native_result = reply;
+    if (recovery) error.recovery = recovery;
+    return error;
+  };
+  const decodeOutputBytes = encoded => {
+    if (typeof encoded !== 'string'
+        || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(encoded)) {
+      throw new Failure('output page contains invalid base64');
+    }
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    let result = '';
+    for (let i = 0; i < encoded.length; i += 4) {
+      const a = alphabet.indexOf(encoded[i]), b = alphabet.indexOf(encoded[i + 1]);
+      const c = alphabet.indexOf(encoded[i + 2]), d = alphabet.indexOf(encoded[i + 3]);
+      result += String.fromCharCode((a << 2) | (b >> 4));
+      if (c >= 0) result += String.fromCharCode(((b & 15) << 4) | (c >> 2));
+      if (d >= 0) result += String.fromCharCode(((c & 3) << 6) | d);
+    }
+    return result;
+  };
+  const resolveOutput = async (id, reply, budget = {remaining:120}) => {
+    const receipt = reply?.structuredContent;
+    if (!receipt?.spilled) return reply;
+    const artifact = receipt.artifact;
+    const recovery = {artifact, complete:false, next_offset:0, pages:0};
+    const fail = message => outputFailure(message, reply, {...recovery});
+    if (receipt.format !== 'mcp_tool_result_json' || !artifact?.id
+        || artifact.complete !== true || !Number.isSafeInteger(artifact.bytes)
+        || artifact.bytes < 1 || artifact.bytes > 480 * 1024
+        || Math.ceil(artifact.bytes / 4096) > budget.remaining) {
+      throw fail('Cannot recover a complete MCP result within the output budget; retain this artifact and read it explicitly');
+    }
+    const expectedHash = artifact.sha256;
+    if (typeof expectedHash !== 'string' || !/^[a-f0-9]{64}$/u.test(expectedHash)) {
+      throw fail('Saved output requires a 64-character lowercase SHA-256 receipt');
+    }
+    const digestFailure = () => fail('Output recovery requires a synchronous SHA-256 digest from this runtime');
+    if (typeof digest !== 'function') throw digestFailure();
+    const chunks = [];
+    while (recovery.next_offset < artifact.bytes) {
+      // Immutable complete artifacts permit independent byte-range reads. Four
+      // small pages avoid serial network latency without filling the 16-call cap.
+      const offsets = Array.from({length:Math.min(4,
+        Math.ceil((artifact.bytes - recovery.next_offset) / 4096))},
+      (_, i) => recovery.next_offset + i * 4096);
+      budget.remaining -= offsets.length;
+      const pages = await Promise.allSettled(offsets.map(offset => call(id, 'ssmcp.output.read', {
+        id:artifact.id, offset, max_bytes:4096,
+      })));
+      for (let i = 0; i < pages.length; i++) {
+        const offset = offsets[i], received = pages[i];
+        if (received.status === 'rejected') {
+          throw fail('Output read failed at byte ' + offset + ': '
+            + (received.reason?.message ?? text(received.reason)));
+        }
+        const pageReply = received.value, page = pageReply?.structuredContent;
+        if (pageReply?.isError || !page || page.spilled) {
+          const error = fail('Output recovery failed; keep the original receipt and cursor');
+          error.read_result = pageReply;
+          throw error;
+        }
+        let bytes;
+        try { bytes = decodeOutputBytes(page.data_base64); }
+        catch (error) { throw fail(error.message); }
+        if (page.id !== artifact.id || page.offset !== offset || page.size !== artifact.bytes
+            || page.complete !== true || page.truncated !== false
+            || page.bytes !== bytes.length
+            || page.next_offset !== offset + bytes.length
+            || page.next_offset !== Math.min(offset + 4096, artifact.bytes)
+            || page.eof !== (page.next_offset === artifact.bytes)) {
+          throw fail('Output recovery received an incomplete or inconsistent page');
+        }
+        chunks.push(bytes);
+        recovery.next_offset = page.next_offset;
+        recovery.pages++;
+      }
+    }
+    let decoded;
+    try {
+      // Decode once: a UTF-8 character may straddle any native byte page.
+      const escaped = chunks.join('').replace(/[\s\S]/gu,
+        byte => '%' + byte.charCodeAt(0).toString(16).padStart(2, '0'));
+      decoded = decodeURIComponent(escaped);
+    } catch { throw fail('Saved output is not complete UTF-8'); }
+    let actualHash;
+    try { actualHash = digest(decoded); }
+    catch { throw digestFailure(); }
+    if (typeof actualHash !== 'string' || !/^[a-f0-9]{64}$/u.test(actualHash)) {
+      throw digestFailure();
+    }
+    if (actualHash !== expectedHash) {
+      throw fail('Saved output SHA-256 does not match its artifact receipt');
+    }
+    let restored;
+    try { restored = parse(decoded); }
+    catch { throw fail('Saved output is not complete MCP JSON'); }
+    if (!restored || typeof restored !== 'object' || isArray(restored)
+        || !isArray(restored.content) || restored.structuredContent?.spilled) {
+      throw fail('Saved output is not an unspilled MCP result');
+    }
+    return {...restored, isError:reply.isError === true || restored.isError === true,
+      recovered_output:{...recovery, complete:true}};
+  };
   const outputs = freeze({
     read: (id, args) => workspaceResult(id, 'ssmcp.output.read', args),
     stat: (id, args) => workspaceResult(id, 'ssmcp.output.stat', args),
     cleanup: id => workspaceResult(id, 'ssmcp.output.cleanup'),
+    result: (id, reply) => resolveOutput(id, reply),
   });
   const fs = freeze({
     list: (id, args) => file('list', id, args),
@@ -584,10 +692,112 @@
       templates: (args = {}) => workspaceResult(id, 'ssmcp.resources.templates', args),
     }),
   });
-  const workers = freeze(Object.fromEntries(
-    ['status','submit','result','cancel']
-      .map(name => [name, (id, args = {}) => workspaceResult(id, 'ssmcp.worker.' + name, args)])
-  ));
+  const workerResult = async (id, name, args, budget = {remaining:120}) => {
+    if (budget.remaining < 1) throw new Failure('Worker observation call budget exhausted');
+    budget.remaining--;
+    const reply = await resolveOutput(id, await call(id, 'ssmcp.worker.' + name, args), budget);
+    if (reply?.isError) {
+      const detail = reply.content?.find(item => item.type === 'text')?.text;
+      throw outputFailure(typeof detail === 'string' ? detail.slice(0, 4096)
+        : 'ssmcp.worker.' + name + ' failed', reply);
+    }
+    const value = reply?.structuredContent;
+    if (!value || typeof value !== 'object' || isArray(value)) {
+      throw outputFailure('Worker tool returned no structured result', reply);
+    }
+    // Keep task, page, claims, retirement receipts, flags and cursors unchanged.
+    // Only the repeated monitor log arrays are omitted from this concise view.
+    const worker = value.worker;
+    return {...value, ...(worker && isArray(worker.slots) ? {worker:{...worker,
+      slots:worker.slots.map(({logs, ...slot}) => ({...slot,
+        ...(isArray(logs) ? {logs_omitted:logs.length} : {})})),
+    }} : {}), ...(reply.recovered_output ? {_output:reply.recovered_output} : {})};
+  };
+  const waitWorkerResult = async (id, args = {}) => {
+    if (!args || typeof args !== 'object' || isArray(args)
+        || keys(args).some(key => !['task_id','timeout_ms'].includes(key))
+        || typeof args.task_id !== 'string' || !args.task_id) {
+      throw new Failure('workers.waitResult requires task_id and optional timeout_ms');
+    }
+    const timeout = args.timeout_ms ?? 20000;
+    if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 25000) {
+      throw new Failure('workers.waitResult timeout_ms must be 0..=25000');
+    }
+    const started = Date.now(), budget = {remaining:120};
+    const rounds = Math.max(1, Math.ceil(timeout / 5000));
+    let value, generation, waitBudget = timeout;
+    for (let i = 0; i < rounds; i++) {
+      const remaining = Math.min(waitBudget, Math.max(0, timeout - (Date.now() - started)));
+      const requestedWait = Math.min(5000, remaining);
+      // The VM exposes a wall clock. Its rollback must never replenish waiting.
+      waitBudget -= requestedWait;
+      value = await workerResult(id, 'result', {
+        task_id:args.task_id, wait_ms:requestedWait,
+      }, budget);
+      const task = value.task;
+      const currentGeneration = value.worker?.generation;
+      if (task?.task_id !== args.task_id
+          || (generation !== undefined && currentGeneration !== generation) || ![
+        'queued','working','cancelling','completed','failed','cancelled','unknown',
+      ].includes(task.status)) {
+        const error = new Failure('Worker result has an unexpected task ID or state; inspect the original task');
+        error.observation = value;
+        error.task_id = args.task_id;
+        throw error;
+      }
+      if (typeof currentGeneration === 'string') generation = currentGeneration;
+      const terminal = ['completed','failed','cancelled','unknown'].includes(task.status);
+      const elapsed = Math.max(0, Date.now() - started);
+      const reason = terminal ? 'terminal' : task.status === 'cancelling' ? 'cancelling'
+        : elapsed >= timeout ? 'timeout' : budget.remaining < 2 ? 'call_budget'
+        : i + 1 === rounds ? 'wait_budget' : null;
+      if (reason) return {result:value, wait:{reason, timed_out:reason === 'timeout', elapsed_ms:elapsed}};
+    }
+  };
+  const waitWorkerAvailable = async (id, args = {}) => {
+    if (!args || typeof args !== 'object' || isArray(args)
+        || keys(args).some(key => !['after','wait_ms'].includes(key))
+        || (args.wait_ms !== undefined && (!Number.isSafeInteger(args.wait_ms)
+          || args.wait_ms < 0 || args.wait_ms > 5000))) {
+      throw new Failure('workers.waitAvailable accepts after and wait_ms (0..=5000)');
+    }
+    const after = args.after;
+    if (after !== undefined && (!after || typeof after !== 'object' || isArray(after)
+        || keys(after).length !== 2 || keys(after).some(key => !['generation','revision'].includes(key))
+        || typeof after.generation !== 'string' || !after.generation
+        || !Number.isSafeInteger(after.revision) || after.revision < 0)) {
+      throw new Failure('workers.waitAvailable after requires the exact generation and safe integer revision');
+    }
+    const name = 'ssmcp.worker.wait_available';
+    const catalog = await searchTools(id, {name_prefix:name, include_schemas:true, limit:50});
+    const descriptor = catalog.tools.find(tool => tool.name === name);
+    if (!descriptor) {
+      const error = new Failure(catalog.complete
+        ? 'Selected client lacks ssmcp.worker.wait_available; pool event waiting requires a native client update'
+        : 'Could not finish worker availability capability discovery');
+      error.code = catalog.complete ? 'WORKER_EVENT_WAIT_UNAVAILABLE' : 'INCOMPLETE_CAPABILITY_DISCOVERY';
+      throw error;
+    }
+    const schema = descriptor.inputSchema, cursor = schema?.properties?.after;
+    const wait = schema?.properties?.wait_ms;
+    if (schema?.type !== 'object' || cursor?.type !== 'object'
+        || cursor.properties?.generation?.type !== 'string'
+        || cursor.properties?.revision?.type !== 'integer'
+        || cursor.properties?.revision?.minimum !== 0
+        || !isArray(cursor.required) || !['generation','revision'].every(key => cursor.required.includes(key))
+        || wait?.type !== 'integer' || wait.minimum !== 0 || wait.maximum !== 5000) {
+      const error = new Failure('Selected worker availability schema is incompatible; inspect its live contract');
+      error.code = 'WORKER_EVENT_WAIT_INCOMPATIBLE';
+      throw error;
+    }
+    // Native schema and authenticated manager checks remain authoritative.
+    // No polling, task submission, identity changes or automatic fallback.
+    return workerResult(id, 'wait_available', args, {remaining:120 - catalog.stats.pages_read});
+  };
+  const workers = freeze({...Object.fromEntries(
+    ['status','attach','submit','tasks','result','cancel','stop','resize','wait','claim','complete','report','release']
+      .map(name => [name, (id, args = {}) => workerResult(id, name, args)])
+  ), waitResult:waitWorkerResult, waitAvailable:waitWorkerAvailable});
   return {
     native: nativeApi,
     capabilities,
