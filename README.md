@@ -164,7 +164,7 @@ if (recovered.isError) return recovered;
 return recovered.structuredContent;
 ```
 
-Recovery reads immutable complete artifacts in 4096-byte pages, at most four
+Recovery reads immutable complete artifacts in 32768-byte pages, at most four
 concurrently, and decodes UTF-8 after joining the exact base64 bytes. It checks
 page sizes, offsets, completeness, truncation, and EOF. `recovered_output` retains
 the artifact receipt and verified byte/page progress; worker views expose it as
@@ -172,9 +172,10 @@ the artifact receipt and verified byte/page progress; worker views expose it as
 JSON text against the receipt's 64-character lowercase SHA-256. A missing or
 invalid synchronous runtime digest, or a hash mismatch, fails recovery without
 returning an unverified result.
-The recovery limit is 480 KiB and 120 native calls per helper operation; a bounded
-wait shares that budget across its observations. Larger or incomplete artifacts,
-invalid JSON, failed reads, and native errors remain errors. Recovery failures
+The recovery limit is 480 KiB, requiring at most 15 output reads, and 120 native
+calls per helper operation; a bounded wait shares that call budget across its
+observations. Larger or incomplete artifacts, invalid JSON, failed reads, and
+native errors remain errors. Recovery failures
 retain `native_result` and `recovery` with the original artifact and exact
 `next_offset`; use explicit `outputs.read` if a larger capture is needed. A spill
 metadata object is never returned as a task result.

@@ -57,7 +57,7 @@ function spilled(reply, mutatePage = page => page) {
     artifact:{id:'artifact', bytes:bytes.length, complete:true, sha256:sha256(bytes)}});
   return {receipt, bytes, read(args) {
     assert.equal(args.id, 'artifact');
-    assert.equal(args.max_bytes, 4096);
+    assert.equal(args.max_bytes, 32768);
     const chunk = bytes.subarray(args.offset, args.offset + args.max_bytes);
     return mcp(mutatePage({id:'artifact', offset:args.offset, bytes:chunk.length,
       next_offset:args.offset + chunk.length, size:bytes.length,
@@ -84,7 +84,7 @@ test('saved MCP JSON recovers exact Unicode, claim, task/page cursors and comple
     cancel_requested:false, retire_requested:false, worker:pool,
     page:{tasks:[task('working')], next_cursor:'exact-next'}};
   const saved = spilled(mcp(value));
-  assert.ok(saved.bytes.length > 4096);
+  assert.ok(saved.bytes.length > 32768);
   const {sdk, calls} = fixture((name, args) => name === 'ssmcp.output.read' ? saved.read(args) : saved.receipt);
   const out = await sdk.workers.wait('pool', {request_id:'original-wait', wait_ms:0});
   assert.deepEqual(plain(out.claim), claim);
@@ -93,10 +93,43 @@ test('saved MCP JSON recovers exact Unicode, claim, task/page cursors and comple
   assert.equal(out._output.complete, true);
   assert.equal(out._output.next_offset, saved.bytes.length);
   assert.equal(out._output.artifact.sha256, sha256(saved.bytes));
+  assert.equal(out._output.pages, Math.ceil(saved.bytes.length / 32768));
+  assert.equal(calls.length, 1 + out._output.pages);
   assert.equal(calls[0].args.request_id, 'original-wait');
   assert.ok(calls.slice(1).every(call => call.id === 'pool' && call.name === 'ssmcp.output.read'));
   const raw = await sdk.outputs.result('pool', saved.receipt);
   assert.deepEqual(plain(raw.structuredContent), value);
+});
+
+test('32-KiB output pages recover large artifacts within the call and concurrency budgets', async () => {
+  for (const [size, pages] of [[132446, 5], [480 * 1024, 15]]) {
+    const value = {content:[{type:'text', text:''}], structuredContent:{task:task('completed')}};
+    const bytes = size - Buffer.byteLength(JSON.stringify(value));
+    value.content[0].text = '中文😀'.repeat(Math.floor(bytes / 10)) + 'x'.repeat(bytes % 10);
+    const saved = spilled(value);
+    assert.equal(saved.bytes.length, size);
+    let active = 0, maximum = 0;
+    const {sdk, calls} = fixture(async (name, args) => {
+      if (name !== 'ssmcp.output.read') return saved.receipt;
+      maximum = Math.max(maximum, ++active);
+      await new Promise(resolve => setImmediate(resolve));
+      const result = saved.read(args);
+      active--;
+      return result;
+    });
+    const out = await sdk.workers.result('pool', {task_id:'task-1'});
+    assert.deepEqual(plain(out.task), value.structuredContent.task);
+    assert.equal(out._output.complete, true);
+    assert.equal(out._output.artifact.sha256, sha256(saved.bytes));
+    assert.equal(out._output.pages, pages);
+    assert.equal(out._output.next_offset, size);
+    assert.equal(maximum, 4);
+    assert.equal(active, 0);
+    assert.equal(calls.length, pages + 1);
+    assert.equal(calls[0].name, 'ssmcp.worker.result');
+    assert.deepEqual(calls.slice(1).map(call => call.args.offset),
+      Array.from({length:pages}, (_, index) => index * 32768));
+  }
 });
 
 test('saved output rejects same-length content changes despite consistent page metadata', async () => {
@@ -189,15 +222,15 @@ test('partial captures, oversized artifacts and invalid page cursors are never t
 });
 
 test('read transport failure preserves its exact artifact and byte cursor', async () => {
-  const saved = spilled(mcp({task:{...task('completed'), output:'x'.repeat(8000)}}));
+  const saved = spilled(mcp({task:{...task('completed'), output:'x'.repeat(40000)}}));
   const {sdk} = fixture((name, args) => {
     if (name !== 'ssmcp.output.read') return saved.receipt;
-    if (args.offset >= 4096) throw new Error('read disconnected');
+    if (args.offset >= 32768) throw new Error('read disconnected');
     return saved.read(args);
   });
   await assert.rejects(sdk.workers.result('pool', {task_id:'task-1'}), error => {
     assert.match(error.message, /read disconnected/);
-    assert.equal(error.recovery.next_offset, 4096);
+    assert.equal(error.recovery.next_offset, 32768);
     assert.equal(error.recovery.artifact.id, 'artifact');
     return true;
   });

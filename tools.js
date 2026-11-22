@@ -333,7 +333,8 @@
       [name, (id, args = {}) => workspaceResult(id, 'ssmcp.session.' + name, args)])
   ));
   // A large native reply is a receipt for saved MCP JSON, not the tool result.
-  // Use small pages so reading that receipt cannot itself spill another reply.
+  // Output reads are exempt from native spilling and accept up to 32 KiB.
+  const outputPageBytes = 32768;
   const outputFailure = (message, reply, recovery) => {
     const error = new Failure(message);
     error.native_result = reply;
@@ -365,7 +366,7 @@
     if (receipt.format !== 'mcp_tool_result_json' || !artifact?.id
         || artifact.complete !== true || !Number.isSafeInteger(artifact.bytes)
         || artifact.bytes < 1 || artifact.bytes > 480 * 1024
-        || Math.ceil(artifact.bytes / 4096) > budget.remaining) {
+        || Math.ceil(artifact.bytes / outputPageBytes) > budget.remaining) {
       throw fail('Cannot recover a complete MCP result within the output budget; retain this artifact and read it explicitly');
     }
     const expectedHash = artifact.sha256;
@@ -377,13 +378,13 @@
     const chunks = [];
     while (recovery.next_offset < artifact.bytes) {
       // Immutable complete artifacts permit independent byte-range reads. Four
-      // small pages avoid serial network latency without filling the 16-call cap.
+      // pages avoid serial network latency without filling the 16-call cap.
       const offsets = Array.from({length:Math.min(4,
-        Math.ceil((artifact.bytes - recovery.next_offset) / 4096))},
-      (_, i) => recovery.next_offset + i * 4096);
+        Math.ceil((artifact.bytes - recovery.next_offset) / outputPageBytes))},
+      (_, i) => recovery.next_offset + i * outputPageBytes);
       budget.remaining -= offsets.length;
       const pages = await Promise.allSettled(offsets.map(offset => call(id, 'ssmcp.output.read', {
-        id:artifact.id, offset, max_bytes:4096,
+        id:artifact.id, offset, max_bytes:outputPageBytes,
       })));
       for (let i = 0; i < pages.length; i++) {
         const offset = offsets[i], received = pages[i];
@@ -404,7 +405,7 @@
             || page.complete !== true || page.truncated !== false
             || page.bytes !== bytes.length
             || page.next_offset !== offset + bytes.length
-            || page.next_offset !== Math.min(offset + 4096, artifact.bytes)
+            || page.next_offset !== Math.min(offset + outputPageBytes, artifact.bytes)
             || page.eof !== (page.next_offset === artifact.bytes)) {
           throw fail('Output recovery received an incomplete or inconsistent page');
         }
