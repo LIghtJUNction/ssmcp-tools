@@ -71,3 +71,7 @@ node --test tests/live-events.test.cjs
 ## License and origin
 
 MIT. The initial helpers were extracted from the SSMCP code-mode API, retaining their behavior and host dispatch boundaries. Runtime validation results belong to the exact SSMCP source and tool-source revisions used in that run.
+
+### Workspace context
+
+The context namespace exposes only context.roots(clientId), which reads the workspace roots advertised by that client. The retired memory helpers status, read, list, compact, fork and switch are no longer exported. Loading the SDK does not restore or request conversation memory.

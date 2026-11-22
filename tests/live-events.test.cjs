@@ -139,3 +139,16 @@ test('incomplete or repeated catalog cursors never trigger legacy reads', async 
   assert.equal(bounded.catalogs.length, 32);
   assert.equal(bounded.calls.length, 0);
 });
+
+
+test('retired memory helpers are absent while workspace roots remain available', async () => {
+  const {sdk, calls, catalogs} = fixture({first: {tools: [current]}});
+  assert.deepEqual(Object.keys(sdk.context), ['roots']);
+  assert.equal(Object.isFrozen(sdk.context), true);
+  for (const name of ['status', 'read', 'list', 'compact', 'fork', 'switch']) {
+    assert.equal(Object.hasOwn(sdk.context, name), false, name);
+  }
+  await sdk.context.roots('one');
+  assert.deepEqual(calls, [{id: 'one', name: 'ssmcp.context.roots', arguments: {}}]);
+  assert.equal(catalogs.length, 0);
+});
