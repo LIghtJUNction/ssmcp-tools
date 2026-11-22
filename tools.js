@@ -264,22 +264,73 @@
   const reload = id => workspaceResult(id, 'ssmcp.client.reload');
   const say = (id, message) => workspaceResult(id, 'ssmcp.ui.message',
     typeof message === 'string' ? {text: message} : message);
+  const advertisesThreadEvents = descriptor => {
+    const acceptsThread = schema => {
+      const action = schema?.properties?.action;
+      return action?.const === 'thread'
+        || (isArray(action?.enum) && action.enum.includes('thread'));
+    };
+    const schema = descriptor?.inputSchema;
+    return acceptsThread(schema)
+      || (isArray(schema?.oneOf) && schema.oneOf.some(acceptsThread));
+  };
+  const threadEventsTool = async id => {
+    let cursor = null, legacy = false, eventsAdvertised = false;
+    const visited = new Set();
+    for (let pageNumber = 0; pageNumber < 32; pageNumber++) {
+      if (visited.has(cursor)) throw new Failure('ui.events catalog repeated a cursor');
+      visited.add(cursor);
+      const page = await tools(id, cursor);
+      if (!page || typeof page !== 'object' || isArray(page)
+          || !isArray(page.tools) || page.tools.length > 64
+          || !searchCursorValid(page.nextCursor ?? null)) {
+        throw new Failure('ui.events received an invalid native catalog page');
+      }
+      for (const descriptor of page.tools) {
+        if (descriptor?.name === 'ssmcp.ui.events') {
+          eventsAdvertised = true;
+          if (advertisesThreadEvents(descriptor)) return 'ssmcp.ui.events';
+        } else if (descriptor?.name === 'ssmcp.ui.history'
+            && advertisesThreadEvents(descriptor)) {
+          legacy = true;
+        }
+      }
+      cursor = page.nextCursor ?? null;
+      if (cursor === null) {
+        if (!eventsAdvertised && legacy) return 'ssmcp.ui.history';
+        throw new Failure('the selected client does not advertise live thread events; update that client');
+      }
+    }
+    throw new Failure('ui.events could not finish bounded capability discovery');
+  };
+  const liveEvents = async (id, args = {}) => {
+    if (typeof id !== 'string' || !id || searchUtf8Bytes(id) > 128) {
+      throw new Failure('ui.events requires a client ID of at most 128 UTF-8 bytes');
+    }
+    if (!args || typeof args !== 'object' || isArray(args)
+        || keys(args).some(key => ![
+          'action', 'client_id', 'agent_id', 'main', 'cursor', 'generation', 'limit',
+        ].includes(key))) {
+      throw new Failure('ui.events accepts only live thread selectors and paging fields');
+    }
+    if (Object.hasOwn(args, 'action') && args.action !== 'thread') {
+      throw new Failure('ui.events only supports action thread');
+    }
+    if (Object.hasOwn(args, 'client_id') && args.client_id !== id) {
+      throw new Failure('ui.events client_id must match the selected client');
+    }
+    // Capability discovery chooses the one compatible read. Authorization,
+    // native errors and incomplete catalogs never trigger a second tool call.
+    const name = await threadEventsTool(id);
+    return workspaceResult(id, name, {...args, action:'thread', client_id:id});
+  };
   const ui = freeze({ ...Object.fromEntries(
-    ['get', 'set', 'action', 'filter', 'queue', 'message', 'present', 'ask', 'questions', 'history', 'harness'].map(name =>
+    ['get', 'set', 'action', 'filter', 'queue', 'message', 'present', 'ask', 'questions', 'harness'].map(name =>
       [name, (id, args = {}) => workspaceResult(id, 'ssmcp.ui.' + name, args)])
-  ), wait: (id, args = {}) => dispatch('wait_user', id, 'wait', args) });
+  ), events: liveEvents, wait: (id, args = {}) => dispatch('wait_user', id, 'wait', args) });
   const sessions = freeze(Object.fromEntries(
     ['list', 'status', 'create', 'restart', 'close'].map(name =>
       [name, (id, args = {}) => workspaceResult(id, 'ssmcp.session.' + name, args)])
-  ));
-  const history = freeze(Object.fromEntries(
-    ['list', 'metadata', 'read', 'search'].map(action =>
-      [action, (id, args = {}) => {
-        if (!args || typeof args !== 'object' || isArray(args) || Object.hasOwn(args, 'action')) {
-          throw new Failure('history arguments must be an object without an action field');
-        }
-        return workspaceResult(id, 'ssmcp.ui.history', {...args, action});
-      }])
   ));
   const outputs = freeze({
     read: (id, args) => workspaceResult(id, 'ssmcp.output.read', args),
@@ -551,7 +602,6 @@
     say,
     ui,
     sessions,
-    history,
     collab,
     messages,
     outputs,

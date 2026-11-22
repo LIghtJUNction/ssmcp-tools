@@ -2,7 +2,7 @@
 
 This repository contains the JavaScript helper functions used by SSMCP code mode. Functions such as `exec.run`, `tools.search`, `say`, `ui.wait`, `messages.send`, and `workers.submit` are editable source in `tools.js`. They call SSMCP's authenticated host operations; editing a helper does not grant additional permissions.
 
-**Integration status:** the companion SSMCP client loader, RC, `tool_client_id`, and `ssmcp tools` commands described below are being implemented on the release work branch. They are not available in the published 0.10.25 client. This repository defines the source contract; publishing it alone does not install or validate that client integration.
+Feature availability follows the selected client's live registry and the exact tool-source receipts. Publishing this repository alone does not install, load, or validate it on a client.
 
 ## Source contract
 
@@ -53,6 +53,20 @@ Agents should inspect the selected source, edit a local override, validate it wi
 `ssmcp tools status` reports the local RC and source identities. `ssmcp tools check` observes the official repository's remote default branch without changing its working tree. `ssmcp tools update` only fast-forwards a clean official checkout. Dirty, detached, or diverged work is preserved and reported. User override repositories are not changed.
 
 `ssmcp update --check` also checks the tool repository, and `ssmcp update` applies an eligible fast-forward. Binary and tool versions are separate. A newer local SSMCP binary does not disable the tool update check.
+
+## Live thread events
+
+Use `ui.events(clientId, {agent_id?, main?, cursor?, generation?, limit?})` to read the bounded event stream held by that live client. The helper supplies `action: "thread"` and the exact selected `client_id`. Follow the returned `generation` and `next_cursor`; earlier events can leave the memory budget. A process exit or reload does not restore them.
+
+The helper discovers the authorized native catalog, prefers `ssmcp.ui.events`, and only uses an older client's `ssmcp.ui.history` when its schema explicitly advertises the `thread` action and the current API is absent. Capability discovery is limited to 32 catalog pages. An authorization error, native failure, malformed catalog, or incomplete scan stops the read. It does not retry through another namespace.
+
+`ui.history` and the global `history.list`, `history.metadata`, `history.read`, and `history.search` helpers are removed. The event helper rejects conversation IDs, archive fields, other actions, and a `client_id` that differs from the selected client. Native account, thread, cursor, and connection checks remain authoritative.
+
+Run the focused helper contract checks with:
+
+```sh
+node --test tests/live-events.test.cjs
+```
 
 ## License and origin
 
