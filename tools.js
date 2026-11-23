@@ -5,39 +5,8 @@
   const {call, dispatch, digest, clients} = core;
   const parse = JSON.parse, stringify = JSON.stringify, freeze = Object.freeze;
   const keys = Object.keys, isArray = Array.isArray, text = String, Failure = Error;
-  // Future client tools need no relay helper or provider-name update.
-  // This object only constructs names; the live client registry remains authoritative.
-  const NativeProxy = Proxy;
-  const nativeApi = id => {
-    if (typeof id !== 'string' || !id || id.length > 128) {
-      throw new Failure('native() requires a client ID');
-    }
-    const path = name => new NativeProxy(() => {}, {
-      get: (_target, key) => {
-        if (key === 'then' || key === 'toJSON' || typeof key !== 'string') return undefined;
-        if (!/^[A-Za-z0-9_-]+$/.test(key) || ['constructor','prototype','__proto__'].includes(key)) {
-          throw new Failure('invalid native API component');
-        }
-        const next = name ? name + '.' + key : key;
-        if (next.length > 128) throw new Failure('native tool name exceeds 128 bytes');
-        return path(next);
-      },
-      apply: (_target, _this, args) => {
-        if (!name || args.length > 1) throw new Failure('native calls accept one argument object');
-        return call(id, name, args[0] === undefined ? {} : args[0]);
-      },
-      set: () => false,
-      defineProperty: () => false,
-      deleteProperty: () => false,
-      setPrototypeOf: () => false,
-    });
-    return path('');
-  };
-  const capabilities = id => call(id, 'ssmcp.client.capabilities', {});
-  const computer = freeze(Object.fromEntries(
-    ['version','download','install','uninstall']
-      .map(name => [name, (id, args = {}) => call(id, 'ssmcp.computer.' + name, args)])
-  ));
+  const MAX_OBSERVATION_WAIT_MS = 55000;
+  const MAX_JS_WAIT_MS = 1000;
   const tools = async (id, cursor = null) => {
     if (cursor !== null && typeof cursor !== 'string') {
       throw new Failure('tool cursor must be a string or null');
@@ -230,6 +199,41 @@
   freeze(tools);
 
   const builtin = (name, args = {}) => dispatch('builtin', '_', name, args);
+  const shortObservation = (args, label, field = 'wait_ms', fallback = MAX_JS_WAIT_MS) => {
+    if (!args || typeof args !== 'object' || isArray(args)) {
+      throw new Failure(label + ' arguments must be an object');
+    }
+    const wait = args[field] === undefined ? fallback : args[field];
+    if (!Number.isSafeInteger(wait) || wait < 0 || wait > MAX_JS_WAIT_MS) {
+      throw new Failure(label + ' ' + field + ' must be 0..=1000 in code_mode; '
+        + 'use the direct events or await tool for a window up to 55000 ms');
+    }
+    return {...args, [field]:wait};
+  };
+  const selectedArguments = (id, args, label) => {
+    if (typeof id !== 'string' || !id || searchUtf8Bytes(id) > 128
+        || !args || typeof args !== 'object' || isArray(args)) {
+      throw new Failure(label + ' requires a client ID and argument object');
+    }
+    if (Object.hasOwn(args, 'client_id') && args.client_id !== id) {
+      throw new Failure(label + ' client_id must match the selected client');
+    }
+    return {...args, client_id:id};
+  };
+  const events = freeze(Object.fromEntries(
+    ['subscribe','read','wait','ack','unsubscribe','subscriptions','publish','policy']
+      .map(action => [action, async (id, args = {}) => {
+        const selected = selectedArguments(id, args, 'events.' + action);
+        if (Object.hasOwn(selected, 'action')) {
+          throw new Failure('events arguments must not override the selected action');
+        }
+        const request = action === 'wait'
+          ? shortObservation(selected, 'events.wait') : selected;
+        // Source bindings, audiences, cursors and idempotency keys belong to the
+        // authenticated host. Forward them once; never invent or retry effects.
+        return builtin('events.' + action, request);
+      }])
+  ));
   const collab = freeze(Object.fromEntries(
     ['join', 'list', 'update', 'send', 'receive', 'ack', 'leave', 'bind'].map(action => [
       action, (clientId, args = {}) => {
@@ -261,7 +265,6 @@
     return reply.structuredContent;
   };
   const file = (name, id, args) => workspaceResult(id, 'ssmcp.fs.' + name, args);
-  const reload = id => workspaceResult(id, 'ssmcp.client.reload');
   const say = (id, message) => workspaceResult(id, 'ssmcp.ui.message',
     typeof message === 'string' ? {text: message} : message);
   const advertisesThreadEvents = descriptor => {
@@ -328,10 +331,6 @@
     ['get', 'set', 'action', 'filter', 'queue', 'message', 'present', 'ask', 'questions', 'harness'].map(name =>
       [name, (id, args = {}) => workspaceResult(id, 'ssmcp.ui.' + name, args)])
   ), events: liveEvents, wait: (id, args = {}) => dispatch('wait_user', id, 'wait', args) });
-  const sessions = freeze(Object.fromEntries(
-    ['list', 'status', 'create', 'restart', 'close'].map(name =>
-      [name, (id, args = {}) => workspaceResult(id, 'ssmcp.session.' + name, args)])
-  ));
   // A large native reply is a receipt for saved MCP JSON, not the tool result.
   // Output reads are exempt from native spilling and accept up to 32 KiB.
   const outputPageBytes = 32768;
@@ -500,28 +499,41 @@
     if (!args || typeof args !== 'object' || isArray(args)) {
       throw new Failure('exec.run requires a command options object');
     }
-    // Preserve native start options, including the optional display-only title.
-    // The client validates title; helpers never infer it from inline script text.
-    const {wait_ms = 5000, max_bytes = defaultMaxBytes, ...startArgs} = args;
-    if (!Number.isSafeInteger(wait_ms) || wait_ms < 0 || wait_ms > 60000) {
-      throw new Failure('exec.run wait_ms must be 0..=60000; it never cancels the command');
+    // Display titles and command execution timeouts remain native start options.
+    const {wait_ms = MAX_JS_WAIT_MS, max_bytes = defaultMaxBytes, ...startArgs} = args;
+    if (!Number.isSafeInteger(wait_ms) || wait_ms < 0 || wait_ms > MAX_OBSERVATION_WAIT_MS) {
+      throw new Failure('exec.run wait_ms must be 0..=55000; it never cancels the command');
     }
     if (!Number.isSafeInteger(max_bytes) || max_bytes < 1 || max_bytes > 32768) {
       throw new Failure('exec.run max_bytes must be 1..=32768 per stream');
     }
     return {wait_ms, max_bytes, startArgs};
   };
-  const executePreparedCommand = async (id, {wait_ms, max_bytes, startArgs}) => {
+  const observationBudget = limit => {
+    let previous = Date.now(), elapsed = 0;
+    return () => {
+      const now = Date.now();
+      // Conservatively close the window if its wall clock moves backwards.
+      elapsed = now < previous ? limit : elapsed + now - previous;
+      previous = now;
+      return Math.max(0, limit - elapsed);
+    };
+  };
+  const executePreparedCommand = async (id, {wait_ms, max_bytes, startArgs}, remaining) => {
+    remaining ??= observationBudget(wait_ms);
     const started = await execution('start', id, startArgs);
     const job = started.job_id;
     if (typeof job !== 'string' || !job) {
       throw new Failure('Command start returned no job_id; inspect exec.list before retrying');
     }
     try {
-      const status = wait_ms === 0 ? started : await execution('wait', id, {job_id:job, wait_ms});
+      const window = Math.min(wait_ms, remaining());
+      const status = window === 0 || started.running === false ? started
+        : await execution('wait', id, {job_id:job, wait_ms:window});
+      // This read is immediate. Never extend the window with another native wait.
       const output = await execution('read', id, {job_id:job, max_bytes});
       const snapshot = output.snapshot ?? status;
-      return {...status, ...snapshot, ...output, snapshot};
+      return {...status, ...snapshot, ...output, snapshot, job_id:job};
     } catch (error) {
       const failure = new Failure('Command started as ' + job + '; ' + (error?.message ?? text(error))
         + '. Inspect exec.status/exec.read for this job before retrying.');
@@ -535,17 +547,25 @@
       throw new Failure('exec.parallel accepts an array of at most 32 command options objects');
     }
     if (!options || typeof options !== 'object' || isArray(options)
-        || keys(options).some(key => key !== 'concurrency')) {
-      throw new Failure('exec.parallel options only accept concurrency');
+        || keys(options).some(key => !['concurrency', 'wait_ms'].includes(key))) {
+      throw new Failure('exec.parallel options only accept concurrency and wait_ms');
     }
     const concurrency = options.concurrency ?? 4;
     if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 8) {
       throw new Failure('exec.parallel concurrency must be 1..=8');
     }
+    const window = options.wait_ms === undefined ? MAX_JS_WAIT_MS : options.wait_ms;
+    if (!Number.isSafeInteger(window) || window < 0 || window > MAX_OBSERVATION_WAIT_MS) {
+      throw new Failure('exec.parallel wait_ms must be 0..=55000 for the entire batch observation');
+    }
+    const remaining = observationBudget(window);
     const results = new Array(commands.length);
     let next = 0;
     const worker = async () => {
+      let launched = false;
       while (next < commands.length) {
+        // Even a zero window may launch the first job in each available slot.
+        if (launched && remaining() === 0) return;
         const index = next++;
         let prepared;
         try {
@@ -559,44 +579,33 @@
         }
         let job;
         try {
-          let value = await executePreparedCommand(id, prepared);
+          launched = true;
+          const value = await executePreparedCommand(id, prepared, remaining);
           job = value.job_id;
-          // A polling deadline never frees a running process's concurrency slot.
-          while (value.running === true) {
-            const status = await execution('wait', id, {job_id:job, wait_ms:60000});
-            if (typeof status.running !== 'boolean') {
-              throw new Failure('command state is unavailable; inspect exec.list before starting more work');
-            }
-            value = {...value, ...status, snapshot:status};
-            if (!status.running) {
-              const output = await execution('read', id, {
-                job_id:job, max_bytes:prepared.max_bytes,
-              });
-              value = {...value, ...output.snapshot, ...output, snapshot:output.snapshot ?? status};
-            }
-          }
-          if (value.running !== false) {
+          if (typeof value.running !== 'boolean') {
             throw new Failure('command completion is unknown; inspect exec.list before starting more work');
           }
           results[index] = {status:'fulfilled', value};
+          // Fulfilled means an observation was returned, not that the job ended.
+          // A running process continues to own its concurrency slot after return.
+          if (value.running) return;
         } catch (error) {
           const job_id = job ?? error?.job_id;
           results[index] = {
             status:'rejected', reason:(error?.message ?? text(error)).slice(0, 4096),
             ...(job_id ? {job_id} : {}),
           };
-          // Observation can fail after launch. Reserve this worker's slot for
-          // that possibly running process instead of oversubscribing the host.
+          // Failed observations and lost launch replies never free a slot.
           return;
         }
       }
     };
     await Promise.all(Array.from({length:Math.min(concurrency, commands.length)}, worker));
+    const reason = remaining() === 0
+      ? 'Command was not started because the batch observation window ended; continue observing returned job IDs before scheduling more work.'
+      : 'Command was not started because available slots are held by running or unconfirmed jobs; inspect returned job IDs before scheduling more work.';
     for (let index = 0; index < results.length; index++) {
-      if (!results[index]) results[index] = {
-        status:'rejected', not_started:true,
-        reason:'Command was not started because a worker could not confirm completion; inspect returned job IDs before retrying.',
-      };
+      if (!results[index]) results[index] = {status:'rejected', not_started:true, reason};
     }
     return results;
   };
@@ -617,6 +626,13 @@
         || typeof args.job_id !== 'string' || !args.job_id) {
       throw new Failure('exec.' + name + ' requires a nonempty job ID or an options object with job_id');
     }
+    if (name === 'wait' || name === 'read') {
+      const wait = args.wait_ms === undefined ? (name === 'wait' ? MAX_JS_WAIT_MS : 0) : args.wait_ms;
+      if (!Number.isSafeInteger(wait) || wait < 0 || wait > MAX_OBSERVATION_WAIT_MS) {
+        throw new Failure('exec.' + name + ' wait_ms must be 0..=55000');
+      }
+      if (name === 'wait' && args.wait_ms === undefined) args = {...args, wait_ms:wait};
+    }
     return execution(name, id, args);
   };
   const exec = freeze({
@@ -632,60 +648,6 @@
     run: executeCommand,
     parallel: parallelCommands,
   });
-  // Explicit RTK argv: the same execution/approval path as exec, never a shell
-  // rewrite, implicit installation or retry without filtering. The output is
-  // RTK's output; its recall/tee hints remain intact for recovery.
-  const rtkCommand = (args, running) => {
-    const allowed = ['command', 'cwd', 'env', 'stdin', 'timeout_ms'];
-    if (running) allowed.push('wait_ms', 'max_bytes');
-    if (!args || typeof args !== 'object' || isArray(args)
-        || keys(args).some(key => !allowed.includes(key))) {
-      throw new Failure('rtk.' + (running ? 'run' : 'start')
-        + ' accepts ' + allowed.join(', '));
-    }
-    const command = args.command;
-    if (!isArray(command) || !command.length || command.length > 255
-        || command.some(arg => typeof arg !== 'string' || arg.includes(String.fromCharCode(0)))
-        || !command[0]) {
-      throw new Failure('rtk command must contain 1..=255 literal argv strings, without the rtk prefix');
-    }
-    return {...args, command:['rtk', ...command]};
-  };
-  const rtkStatus = async (id, args = {}) => {
-    if (!args || typeof args !== 'object' || isArray(args)
-        || keys(args).some(key => !['cwd', 'env'].includes(key))) {
-      throw new Failure('rtk.status accepts cwd and env');
-    }
-    let probe;
-    try {
-      probe = await executeCommand(id, {
-        ...args, command:['rtk', '--version'], timeout_ms:5000, wait_ms:5000, max_bytes:1024,
-      });
-    } catch (error) {
-      // Only a native spawn failure proves RTK cannot run. Authorization and
-      // connection failures must stay errors, with any launched job_id intact.
-      if (!error?.job_id && error?.message?.startsWith('could not start command:')) {
-        return {available:false, version:null, error:error.message};
-      }
-      throw error;
-    }
-    const version = typeof probe.stdout === 'string'
-      ? probe.stdout.trim().split(String.fromCharCode(10))[0] : '';
-    return {
-      ...probe,
-      available:probe.running === true ? null : probe.exit_code === 0 && /^rtk\s+/.test(version),
-      version:/^rtk\s+/.test(version) ? version : null,
-    };
-  };
-  const rtk = freeze({
-    status: rtkStatus,
-    start: async (id, args) => execution('start', id, rtkCommand(args, false)),
-    run: async (id, args) => executeCommand(id, rtkCommand(args, true)),
-  });
-  const terminal = freeze(Object.fromEntries(
-    ['open','list','select','close','read','write','status','resize']
-      .map(name => [name, (id, args = {}) => workspaceResult(id, 'terminal.' + name, args)])
-  ));
   const rsync = (args) => builtin('sync', args);
   const jobs = freeze({
     list: () => builtin('jobs.list'),
@@ -694,7 +656,19 @@
     cancel: id => builtin('jobs.cancel', {id}),
   });
   const waitFor = freeze(Object.assign(
-    (id, args = {}) => builtin('await', {...args, client_id: id}),
+    async (id, args = {}) => {
+      const selected = selectedArguments(id, args, 'waitFor');
+      if (selected.op === 'cancel') return builtin('await', selected);
+      const request = shortObservation(selected, 'waitFor', 'timeout_ms');
+      if (request.timeout_ms < 1000) {
+        throw new Failure('waitFor timeout_ms must be 1000 in code_mode; use the direct await tool for longer windows');
+      }
+      if (request.window_ms !== undefined) {
+        shortObservation(request, 'waitFor', 'window_ms');
+        if (request.window_ms < 1000) throw new Failure('waitFor window_ms must be 1000 in code_mode');
+      }
+      return builtin('await', request);
+    },
     {cancel: (id, waitId) => builtin('await', {client_id: id, op: 'cancel', wait_id: waitId})}
   ));
   const ports = freeze({
@@ -739,48 +713,34 @@
         || typeof args.task_id !== 'string' || !args.task_id) {
       throw new Failure('workers.waitResult requires task_id and optional timeout_ms');
     }
-    const timeout = args.timeout_ms ?? 20000;
-    if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 25000) {
-      throw new Failure('workers.waitResult timeout_ms must be 0..=25000');
+    const timeout = shortObservation(args, 'workers.waitResult', 'timeout_ms').timeout_ms;
+    const started = Date.now();
+    const value = await workerResult(id, 'result', {
+      task_id:args.task_id, wait_ms:timeout,
+    });
+    const task = value.task;
+    if (task?.task_id !== args.task_id || ![
+      'queued','working','cancelling','completed','failed','cancelled','unknown',
+    ].includes(task.status)) {
+      const error = new Failure('Worker result has an unexpected task ID or state; inspect the original task');
+      error.observation = value;
+      error.task_id = args.task_id;
+      throw error;
     }
-    const started = Date.now(), budget = {remaining:120};
-    const rounds = Math.max(1, Math.ceil(timeout / 5000));
-    let value, generation, waitBudget = timeout;
-    for (let i = 0; i < rounds; i++) {
-      const remaining = Math.min(waitBudget, Math.max(0, timeout - (Date.now() - started)));
-      const requestedWait = Math.min(5000, remaining);
-      // The VM exposes a wall clock. Its rollback must never replenish waiting.
-      waitBudget -= requestedWait;
-      value = await workerResult(id, 'result', {
-        task_id:args.task_id, wait_ms:requestedWait,
-      }, budget);
-      const task = value.task;
-      const currentGeneration = value.worker?.generation;
-      if (task?.task_id !== args.task_id
-          || (generation !== undefined && currentGeneration !== generation) || ![
-        'queued','working','cancelling','completed','failed','cancelled','unknown',
-      ].includes(task.status)) {
-        const error = new Failure('Worker result has an unexpected task ID or state; inspect the original task');
-        error.observation = value;
-        error.task_id = args.task_id;
-        throw error;
-      }
-      if (typeof currentGeneration === 'string') generation = currentGeneration;
-      const terminal = ['completed','failed','cancelled','unknown'].includes(task.status);
-      const elapsed = Math.max(0, Date.now() - started);
-      const reason = terminal ? 'terminal' : task.status === 'cancelling' ? 'cancelling'
-        : elapsed >= timeout ? 'timeout' : budget.remaining < 2 ? 'call_budget'
-        : i + 1 === rounds ? 'wait_budget' : null;
-      if (reason) return {result:value, wait:{reason, timed_out:reason === 'timeout', elapsed_ms:elapsed}};
-    }
+    const terminal = ['completed','failed','cancelled','unknown'].includes(task.status);
+    const elapsed = Math.max(0, Date.now() - started);
+    const reason = terminal ? 'terminal' : task.status === 'cancelling' ? 'cancelling'
+      : elapsed >= timeout ? 'timeout' : 'wait_budget';
+    return {result:value, wait:{reason, timed_out:reason === 'timeout', elapsed_ms:elapsed}};
   };
   const waitWorkerAvailable = async (id, args = {}) => {
     if (!args || typeof args !== 'object' || isArray(args)
         || keys(args).some(key => !['after','wait_ms'].includes(key))
         || (args.wait_ms !== undefined && (!Number.isSafeInteger(args.wait_ms)
-          || args.wait_ms < 0 || args.wait_ms > 5000))) {
-      throw new Failure('workers.waitAvailable accepts after and wait_ms (0..=5000)');
+          || args.wait_ms < 0 || args.wait_ms > MAX_JS_WAIT_MS))) {
+      throw new Failure('workers.waitAvailable accepts after and wait_ms (0..=1000 in code_mode); use direct await/events for windows up to 55000 ms');
     }
+    const request = shortObservation(args, 'workers.waitAvailable');
     const after = args.after;
     if (after !== undefined && (!after || typeof after !== 'object' || isArray(after)
         || keys(after).length !== 2 || keys(after).some(key => !['generation','revision'].includes(key))
@@ -805,40 +765,36 @@
         || cursor.properties?.revision?.type !== 'integer'
         || cursor.properties?.revision?.minimum !== 0
         || !isArray(cursor.required) || !['generation','revision'].every(key => cursor.required.includes(key))
-        || wait?.type !== 'integer' || wait.minimum !== 0 || wait.maximum !== 5000) {
+        || wait?.type !== 'integer' || wait.minimum !== 0
+        || !Number.isSafeInteger(wait.maximum) || wait.maximum < request.wait_ms) {
       const error = new Failure('Selected worker availability schema is incompatible; inspect its live contract');
       error.code = 'WORKER_EVENT_WAIT_INCOMPATIBLE';
       throw error;
     }
     // Native schema and authenticated manager checks remain authoritative.
     // No polling, task submission, identity changes or automatic fallback.
-    return workerResult(id, 'wait_available', args, {remaining:120 - catalog.stats.pages_read});
+    return workerResult(id, 'wait_available', request, {remaining:120 - catalog.stats.pages_read});
   };
   const workers = freeze({...Object.fromEntries(
     ['status','attach','submit','tasks','result','cancel','stop','resize','wait','claim','complete','report','release']
-      .map(name => [name, (id, args = {}) => workerResult(id, name, args)])
+      .map(name => [name, async (id, args = {}) => workerResult(id, name,
+        name === 'wait' ? shortObservation(args, 'workers.wait')
+          : name === 'result' ? shortObservation(args, 'workers.result', 'wait_ms', 0) : args)])
   ), waitResult:waitWorkerResult, waitAvailable:waitWorkerAvailable});
   return {
-    native: nativeApi,
-    capabilities,
     tools,
-    computer,
-    reload,
     say,
     ui,
-    sessions,
     collab,
     messages,
+    events,
     outputs,
     fs,
     context,
     skills,
     agents,
     exec,
-    rtk,
-    terminal,
     rsync,
-    sync: rsync,
     jobs,
     waitFor,
     ports,

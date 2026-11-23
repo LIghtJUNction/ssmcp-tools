@@ -24,35 +24,64 @@ core => ({
 
 The host's `call`, `clients`, `image`, `print`, and `console` primitives cannot be replaced. Message completion permission is validated by the host after the script returns; a helper cannot create approval by returning `may_finish: true`.
 
-## Local iteration
+## Source selection and local iteration
 
-SSMCP's official checkout lives at `$XDG_DATA_HOME/ssmcp/tools/official` (normally `~/.local/share/ssmcp/tools/official`). It is an ordinary Git working tree. First use can initialize it offline from the fixed Git bundle shipped with SSMCP. Its origin is `https://github.com/LIghtJUNction/ssmcp-tools.git`.
+The client owns source selection. Follow its [source-loading contract](https://github.com/LIghtJUNction/ssmcp/blob/main/docs/code-mode.md#find-and-iterate-tool-implementations) and the outer `structuredContent.tool_sources` receipt for the exact loaded layers, source hashes and Git identity. Older clients can use a different loader. A file appearing in a workspace does not establish which source the current run executed.
 
-The client reads `$XDG_CONFIG_HOME/ssmcp/ssmcprc.toml` (normally `~/.config/ssmcp/ssmcprc.toml`) on each run. It loads the official source first and then the listed overrides in order:
+Use an isolated checkout or a selected project override for edits. Run the focused checks before activating source, then use a new code-mode request and verify its receipt. Native authentication, schemas and resource boundaries still apply. A source or schema failure remains an error.
 
-```toml
-version = 1
+`tool_client_id` selects the authorized client whose source configuration applies. An existing verified agent binding selects that client's sources by default. Multiple clients without a selection use an explicitly identified official seed; their private overrides are not combined.
 
-[tools]
-overrides = [
-  ".ssmcp/tools/local",
-  "/absolute/path/to/my-tools.js",
-]
-```
+`ssmcp tools status` reports local source identity and may initialize the official checkout from the bundled seed. `check` observes upstream state, while `update` may fast-forward an eligible clean official checkout. Dirty or diverged work is preserved. Publishing source and updating a running client's selected helper are separate steps.
 
-Relative paths resolve against that client's workspace. A directory contains its own `manifest.json`; a registered JavaScript file is loaded directly. SSMCP does not search or execute unregistered workspace files.
+## Public helpers and removed aliases
 
-Agents should inspect the selected source, edit a local override, validate it with a bounded code-mode call, and commit useful changes in the relevant repository. A source or schema error remains visible; the loader does not silently return to an embedded helper implementation. Source receipts include the exact loaded content hashes, Git commit and dirty state when a Git repository is present.
+The host provides `call`, `clients`, `image`, `print` and `console`. This factory exports `tools`, `say`, `ui`, `collab`, `messages`, `events`, `outputs`, `fs`, `context`, `skills`, `agents`, `exec`, `rsync`, `jobs`, `waitFor`, `ports`, `resources` and `workers`.
 
-## Choosing the client
+The following eight convenience exports have been deleted from the factory. Their native operations remain accessible:
 
-`tool_client_id` selects the authorized client whose RC and sources apply to a code-mode run. An existing verified agent binding selects that client's sources by default. A single available client can be selected automatically. Multiple available clients without a selection use an explicitly identified read-only official seed, with a prompt to choose a client; their local overrides are not combined.
+| Removed export | Current API |
+| --- | --- |
+| `sync` | `rsync(options)` |
+| `native` | `call(clientId, discoveredName, args)` |
+| `capabilities` | `call(clientId,"ssmcp.client.capabilities",{})` |
+| `computer` | `call(clientId,"ssmcp.computer."+operation,args)` |
+| `reload` | `call(clientId,"ssmcp.client.reload",{})` |
+| `sessions` | `call(clientId,"ssmcp.session."+operation,args)` |
+| `rtk` | `exec.start/run(clientId,{command:["rtk",...argv]})` |
+| `terminal` | `call(clientId,"terminal."+operation,args)` |
 
-## Updates
+Discover exact names and schemas with `tools.search`. A raw `call` returns the complete MCP result: inspect `isError` before reading `structuredContent`. Transport errors remain rejected promises. No replacement proxy or automatic fallback recreates the deleted aliases.
 
-`ssmcp tools status` reports the local RC and source identities. `ssmcp tools check` observes the official repository's remote default branch without changing its working tree. `ssmcp tools update` only fast-forwards a clean official checkout. Dirty, detached, or diverged work is preserved and reported. User override repositories are not changed.
+## Event subscriptions
 
-`ssmcp update --check` also checks the tool repository, and `ssmcp update` applies an eligible fast-forward. Binary and tool versions are separate. A newer local SSMCP binary does not disable the tool update check.
+`events` exposes eight methods: `subscribe`, `read`, `wait`, `ack`, `unsubscribe`, `subscriptions`, `publish` and `policy`. Each accepts the selected client ID followed by an arguments object, then dispatches exactly one `events.<action>` builtin with `client_id`. It preserves source identities, subscription IDs, cursors, native errors and reply fields.
+
+~~~js
+const subscription = await events.subscribe(clientId, {
+  request_id: "build-events-1",
+  filter: {kinds:["worker.completed"],client_ids:[clientId]},
+});
+return subscription;
+~~~
+
+The subscription request may include `after` and `source_agents:[{client_id,agent_id,token}]`. Each additional source needs its own private credentials. The selected client uses explicit `agent_id`/`token` or this run's verified `collab.bind`. A token for one client does not authenticate another; the native relay checks account access and exact private subscription ownership.
+
+Use the returned subscription ID with `read` or `wait`. JS `events.wait` defaults to 1000 ms and accepts 0–1000 ms. It never loops. For a longer observation, call the public `events` tool directly with `action:"wait"`, or the public `await` tool with `{type:"event",subscription_id,limit?}`; supporting relays permit up to 55000 ms without holding a JavaScript slot.
+
+`ack` forwards `subscription_id` and `through`; `unsubscribe` forwards `subscription_id`. `subscriptions` lists the caller's subscriptions. `publish` forwards `request_id`, a `custom.*` name and `data`. `policy` forwards its optional native `patch`. The helper does not acknowledge, subscribe again, publish again or change cursors automatically. Check the supporting relay's current schema for retained ranges and authorization. Updating this repository alone does not implement the relay event service.
+
+`waitFor` also performs one short `await` operation. Its timeout defaults to 1000 ms; an explicit timeout or window must be 1000 ms. Resume an outer wait with its original `wait_id`, exact `after` cursor and new observation window. `waitFor.cancel` only stops that observation.
+
+## Bounded command observations
+
+`exec.run` starts once, waits at most once, then immediately reads one output page. Its `wait_ms` defaults to 1000 ms and accepts 0–55000 ms. Time spent launching reduces the remaining observation window. It returns the actual job state, original `job_id`, stdout/stderr cursors and capture metadata. A command can still be running when this call returns.
+
+`exec.parallel` accepts up to 32 items and `{concurrency:4,wait_ms:1000}`. Concurrency accepts 1–8. The batch shares one `wait_ms` observation window, at most 55000 ms; an item's own `wait_ms` can reduce its wait further. Each launched job receives at most one wait and one read. Only a confirmed completed job frees its batch slot. Running and unconfirmed jobs keep their slots, and remaining items are explicitly `not_started:true`. With a zero batch window, at most the first job in each slot starts.
+
+`fulfilled` means an observation was returned. Inspect `value.running` and `value.exit_code` to determine completion and success. Local validation failures are `rejected` with `not_started:true`. A failure after launch retains the known `job_id`; a lost launch response may require `exec.list`. Neither case cancels or repeats work. `timeout_ms` still controls the command's independent execution deadline.
+
+The window bounds requested observation, not arbitrary network or output-transfer latency. Prefer the short default; start long work with `exec.start` and observe it through the public `await` tool or subsequent reads. Direct `exec.wait` defaults to 1000 ms and accepts explicit waits up to 55000 ms when the native client supports them. `exec.read` is immediate unless an explicit native wait is supplied. Preserve both stream cursors across reads.
 
 ## Live thread events
 
@@ -70,81 +99,42 @@ node --test tests/live-events.test.cjs
 
 ## Worker tasks and bounded waits
 
-`workers.status`, `attach`, `submit`, `tasks`, `result`, `cancel`, `stop`, and
-`resize` call the corresponding
-`ssmcp.worker.*` tools with the current authenticated binding. External workers
-also have `wait`, `claim`, `complete`, `report`, and `release` helpers. Arguments
-are forwarded unchanged; native schemas and ownership checks remain authoritative.
-These helpers do not start models, switch identities, or automatically repeat a
-submission. A manager can submit once and wait for that exact task:
+`workers.status/attach/submit/tasks/result/cancel/stop/resize` and external worker
+`wait/claim/complete/report/release` call the corresponding `ssmcp.worker.*`
+operations under the current authenticated binding. They do not start a model,
+switch identity or resubmit work. Preserve each native claim and retirement
+receipt unchanged.
 
-```js
-const accepted = await workers.submit(poolId, {
-  request_id: "build-request-1",
-  text: "Run the assigned checks and report their actual outcome.",
-});
-return await workers.waitResult(poolId, {
-  task_id: accepted.task.task_id,
-  timeout_ms: 20000,
-});
-```
+`workers.wait` defaults to one 1000 ms observation. `workers.result` defaults to
+an immediate observation. Both reject JS waits above 1000 ms. Long observations
+belong in the public `await` tool or a direct native call using its discovered
+schema; a supporting client accepts up to 55000 ms.
 
-`waitResult` accepts `timeout_ms` from 0 to 25000, default 20000. It uses bounded
-native `worker.result` waits of at most 5000 ms each. It returns
-`{result: <native result view>, wait: <observation metadata>}`. The actual
-`result.task.status` remains `queued`, `working`, `cancelling`, `completed`, `failed`, `cancelled`,
-or `unknown`. The separate `wait` object reports `reason`, `timed_out`, and
-`elapsed_ms`. Terminal observations and `cancelling` stop further waits.
-`unknown` preserves the native `replay_safe` value and never triggers resubmission.
-A waiting deadline does not cancel a task or make a working task fail. Resume by
-observing the same task ID. The time setting bounds requested native waiting;
-network calls and result recovery can add latency, so keep the enclosing
-code-mode deadline longer. Call and iteration budgets also stop observation with
-the last actual task state, identified by `call_budget` or `wait_budget`.
+`workers.waitResult(poolId,{task_id,timeout_ms:1000})` makes exactly one short
+`worker.result` call and retains the existing envelope
+`{result:<native view>,wait:{reason,timed_out,elapsed_ms}}`. Timeout accepts
+0–1000 ms. The returned task keeps its actual queued, working, cancelling,
+completed, failed, cancelled or unknown state. An unknown result preserves
+`replay_safe` and never triggers submission. Observe the same task ID in a later
+outer call to continue; expiry does not cancel it.
 
-An external worker retains its original `request_id` when retrying `workers.wait`
-after a lost response. Preserve the returned claim unchanged for `complete`, then
-use a new wait ID. Retirement requires the exact native retirement receipt.
+An external worker reuses its original `request_id` when retrying a lost wait
+response. Preserve the assigned claim for `complete`, then choose a new wait
+request ID. Retirement uses the exact native receipt.
 
-### Pool availability events
+### Pool availability
 
-`workers.waitAvailable(poolId, {after?, wait_ms?})` discovers the selected client's
-`ssmcp.worker.wait_available` and forwards the arguments exactly once when its
-generation/revision schema is advertised. Discover its current schema before choosing arguments.
-There is no periodic polling fallback. Missing support raises
-`WORKER_EVENT_WAIT_UNAVAILABLE`. If bounded discovery ends before finding the tool,
-an incomplete catalog remains a discovery error.
+`workers.waitAvailable(poolId,{after?,wait_ms?})` discovers the advertised
+`ssmcp.worker.wait_available` generation/revision schema and calls it once.
+Its JS wait defaults to 1000 ms and accepts 0–1000 ms. The capability check
+supports both the older 5000 ms and current 55000 ms native schema without
+claiming that the native primitive exists on every client. Missing support or
+incomplete discovery is an error; there is no polling fallback.
 
-The inspected client 0.10.27 registry does **not** advertise this primitive. The
-inspected relay 0.10.26 await targets are `exec`, `job`, `agent_status`,
-`agent_messages`, and `user_input`; an agent presence status does not establish
-worker-pool capacity. Updating this JavaScript repository alone therefore cannot
-provide pool event wakeups on those versions.
-
-The [native source contract at 9902b88](https://github.com/LIghtJUNction/ssmcp/blob/9902b88c8d48639cbe5e0effacbd0877e55be174/src/worker/pool.rs)
-implements a wait on capacity revisions under the existing manager binding.
-Omit `after` for an immediate snapshot; pass its exact `{generation, revision}`
-to wait up to 5000 ms for a change. The native statuses are `current`, `changed`,
-`unchanged`, and `not_accepting`. A change is an observation, not a reservation
-or proof that an idle worker now exists: inspect `availability.accepting` and
-`availability.idle_slots` before scheduling. Progress logs do not advance this
-capacity revision. Stale generations remain native errors.
-
-```js
-const current = await workers.waitAvailable(poolId, {wait_ms: 0});
-const {generation, revision} = current.availability;
-return await workers.waitAvailable(poolId, {
-  after: {generation, revision},
-  wait_ms: 5000,
-});
-```
-
-The helper's contract fixtures use that pinned schema. Native event execution
-still needs a client build exposing it; these JS tests are not native lifecycle
-tests. As a temporary coordination channel, a worker can send its manager an
-explicit collaboration message after completing a claim and entering idle.
-The manager can await that inbox event, then verify the actual pool receipt;
-the message alone does not establish available capacity.
+Omit `after` for the native current snapshot, or pass the returned exact
+`{generation,revision}` cursor to observe a change. Inspect the actual accepting
+state and idle capacity before scheduling. An event does not reserve a worker.
+Generation changes, account access and stale cursors remain native decisions.
 
 ### Recovering saved results
 
@@ -173,29 +163,35 @@ JSON text against the receipt's 64-character lowercase SHA-256. A missing or
 invalid synchronous runtime digest, or a hash mismatch, fails recovery without
 returning an unverified result.
 The recovery limit is 480 KiB, requiring at most 15 output reads, and 120 native
-calls per helper operation; a bounded wait shares that call budget across its
-observations. Larger or incomplete artifacts, invalid JSON, failed reads, and
+calls per helper operation; a short worker observation uses that same bounded
+recovery budget. Larger or incomplete artifacts, invalid JSON, failed reads, and
 native errors remain errors. Recovery failures
 retain `native_result` and `recovery` with the original artifact and exact
 `next_offset`; use explicit `outputs.read` if a larger capture is needed. A spill
 metadata object is never returned as a task result.
 
-Run the focused contracts with:
+## Checks and delivery
 
-```sh
-node --test tests/live-events.test.cjs tests/workers.test.cjs tests/output-memory.test.cjs
-```
+~~~sh
+node --test tests/*.test.cjs
+~~~
 
-Publishing a reviewed Git commit and updating a client's clean official checkout
-with `ssmcp tools update` are separate steps. Once the source is updated, the next
-selected-client code-mode run interprets it; these helpers need no Rust rebuild
-or active-session reload. Check that run's tool-source receipt to identify the
-loaded commit and hash. New native event primitives still require native support.
+These tests exercise helper dispatch, short waits, shared execution budgets,
+exact claim preservation, error handling and bounded output recovery. They do not
+establish native event authorization or deployment on a live client. The SSMCP
+repository also runs the real code-mode JSON bridge against its packaged bundle.
+
+Commit source changes, then separately update the selected client's helper when
+authorized. Every new code-mode call records the actual loaded source identity.
+New native capabilities still require a supporting native build.
 
 ## License and origin
 
-MIT. The initial helpers were extracted from the SSMCP code-mode API, retaining their behavior and host dispatch boundaries. Runtime validation results belong to the exact SSMCP source and tool-source revisions used in that run.
+MIT. These helpers were extracted from the SSMCP code-mode API. Runtime validation
+belongs to the exact native build and tool-source revisions observed in that run.
 
 ### Workspace context
 
-The context namespace exposes only context.roots(clientId), which reads the workspace roots advertised by that client. The retired memory helpers status, read, list, compact, fork and switch are no longer exported. Loading the SDK does not restore or request conversation memory.
+`context.roots(clientId)` lists the client's advertised workspace roots. Retired
+memory status/read/list/compact/fork/switch helpers remain absent. Loading the SDK
+does not restore or request conversation memory.

@@ -11,8 +11,8 @@ const plain = value => JSON.parse(JSON.stringify(value));
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const mcp = value => ({content:[{type:'text', text:JSON.stringify(value)}], structuredContent:value, isError:false});
 const claim = {attempt:1, epoch:1, generation:'generation', id:'claim', slot:0, task_id:'task-1'};
-// Native schema from ssmcp commit 9902b88c8d48639cbe5e0effacbd0877e55be174,
-// src/worker/pool.rs. Current live 0.10.27 does not yet advertise this tool.
+// Exercise the older 5,000 ms native availability schema as well as the
+// 55,000 ms schema; JavaScript observations remain at most 1,000 ms.
 const availabilityTool = {name:'ssmcp.worker.wait_available', inputSchema:{
   type:'object', additionalProperties:false, required:[], properties:{
     after:{type:'object', additionalProperties:false, required:['generation','revision'],
@@ -267,19 +267,18 @@ test('read transport failure preserves its exact artifact and byte cursor', asyn
   });
 });
 
-test('bounded native waits return completion for the same task without resubmitting', async () => {
-  let round = 0;
+test('one short native wait returns the same task without resubmitting', async () => {
   const {sdk, calls} = fixture((name, args, clock) => {
     assert.equal(name, 'ssmcp.worker.result');
-    clock.advance(++round === 1 ? 5000 : 100);
-    return mcp({task:{...task(round === 1 ? 'working' : 'completed'), output:round === 1 ? null : 'actual output'}});
+    clock.advance(100);
+    return mcp({task:{...task('completed'), output:'actual output'}});
   });
-  const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:10000});
+  const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:1000});
   assert.equal(out.result.task.output, 'actual output');
   assert.equal(out.wait.reason, 'terminal');
   assert.equal(out.wait.timed_out, false);
-  assert.equal(calls.length, 2);
-  assert.ok(calls.every(call => call.id === 'pool' && call.args.task_id === 'task-1' && call.args.wait_ms === 5000));
+  assert.deepEqual(calls, [{id:'pool', name:'ssmcp.worker.result',
+    args:{task_id:'task-1',wait_ms:1000}}]);
 });
 
 test('timeout keeps queued/working state; unknown and cancelling never trigger retries', async () => {
@@ -288,10 +287,10 @@ test('timeout keeps queued/working state; unknown and cancelling never trigger r
       clock.advance(['queued','working'].includes(state) ? args.wait_ms : 1);
       return mcp({task:task(state)});
     });
-    const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:7000});
+    const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:1000});
     assert.deepEqual(plain(out.result.task), task(state));
     assert.equal(out.wait.timed_out, ['queued','working'].includes(state));
-    assert.equal(calls.length, ['queued','working'].includes(state) ? 2 : 1);
+    assert.equal(calls.length, 1, 'one helper call never polls the task again');
     assert.ok(calls.every(call => call.name === 'ssmcp.worker.result'));
   }
 });
@@ -301,7 +300,7 @@ test('a nonblocking observation and malformed wait results remain bounded', asyn
   const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:0});
   assert.equal(out.wait.timed_out, true);
   assert.deepEqual(calls[0].args, {task_id:'task-1', wait_ms:0});
-  for (const args of [{}, {task_id:'task-1', timeout_ms:25001}, {task_id:'task-1', manager:'forged'}]) {
+  for (const args of [{}, {task_id:'task-1', timeout_ms:1001}, {task_id:'task-1', manager:'forged'}]) {
     await assert.rejects(sdk.workers.waitResult('pool', args));
   }
   assert.equal(calls.length, 1);
@@ -331,7 +330,7 @@ test('availability rejects incompatible capabilities and forged cursors without 
   await assert.rejects(incompatible.sdk.workers.waitAvailable('pool'), error => error.code === 'WORKER_EVENT_WAIT_INCOMPATIBLE');
   assert.equal(incompatible.calls.length, 0);
   const valid = fixture(() => mcp({status:'unchanged', changed:false}), [availabilityTool]);
-  for (const args of [{request_id:'wrong-contract'}, {wait_ms:5001},
+  for (const args of [{request_id:'wrong-contract'}, {wait_ms:1001},
     {after:{generation:'g', revision:1, owner:'forged'}},
     {after:{generation:'g', revision:Number.MAX_SAFE_INTEGER + 1}}]) {
     await assert.rejects(valid.sdk.workers.waitAvailable('pool', args));
@@ -343,17 +342,17 @@ test('availability rejects incompatible capabilities and forged cursors without 
   assert.equal(rejected.calls.length, 1);
 });
 
-test('a changed pool generation stops task waiting without retry or resubmission', async () => {
+test('separate observations preserve actual generations without an automatic follow-up', async () => {
   let iteration = 0;
   const {sdk, calls} = fixture((name, args, clock) => {
-    clock.advance(5000);
+    clock.advance(args.wait_ms);
     return mcp({task:task('working'), worker:{generation:++iteration === 1 ? 'old' : 'replacement'}});
   });
-  await assert.rejects(sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:20000}), error => {
-    assert.equal(error.task_id, 'task-1');
-    assert.equal(error.observation.worker.generation, 'replacement');
-    return true;
-  });
+  const first = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:1000});
+  assert.equal(first.result.worker.generation, 'old');
+  assert.equal(calls.length, 1);
+  const second = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:1000});
+  assert.equal(second.result.worker.generation, 'replacement');
   assert.equal(calls.length, 2);
   assert.ok(calls.every(call => call.name === 'ssmcp.worker.result'));
 });
@@ -364,7 +363,7 @@ test('a legal near-64-KiB terminal output survives a spilled native wait result'
   const value = {task:{...task('completed'), output}, worker:{generation:'generation'}, wait:{native:'preserved'}};
   const saved = spilled(mcp(value));
   const {sdk, calls} = fixture((name, args) => name === 'ssmcp.output.read' ? saved.read(args) : saved.receipt);
-  const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:20000});
+  const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:1000});
   assert.equal(out.result.task.output, output);
   assert.deepEqual(plain(out.result.wait), value.wait);
   assert.equal(out.result._output.complete, true);
@@ -377,9 +376,36 @@ test('wall-clock rollback cannot increase the native waiting budget', async () =
     clock.advance(-1000);
     return mcp({task:task('working')});
   });
-  const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:7000});
-  assert.deepEqual(calls.map(call => call.args.wait_ms), [5000, 2000]);
+  const out = await sdk.workers.waitResult('pool', {task_id:'task-1', timeout_ms:1000});
+  assert.deepEqual(calls.map(call => call.args.wait_ms), [1000]);
   assert.equal(out.result.task.status, 'working');
   assert.equal(out.wait.reason, 'wait_budget');
   assert.equal(out.wait.elapsed_ms, 0);
+});
+
+test('worker observations use short defaults and reject long waits before dispatch', async () => {
+  const {sdk, calls} = fixture(() => mcp({task:task('working'), status:'waiting'}));
+  const waiting = Object.freeze({request_id:'same-wait-id'});
+  const reading = Object.freeze({task_id:'task-1'});
+  await sdk.workers.wait('pool', waiting);
+  await sdk.workers.result('pool', reading);
+  assert.deepEqual(calls.map(call => call.args), [
+    {request_id:'same-wait-id',wait_ms:1000}, {task_id:'task-1',wait_ms:0},
+  ]);
+  assert.deepEqual(waiting, {request_id:'same-wait-id'});
+  assert.deepEqual(reading, {task_id:'task-1'});
+  for (const wait_ms of [1001,55000,55001,-1,null,NaN]) {
+    await assert.rejects(sdk.workers.wait('pool', {...waiting,wait_ms}), /direct events or await/);
+    await assert.rejects(sdk.workers.result('pool', {...reading,wait_ms}), /direct events or await/);
+  }
+  assert.equal(calls.length, 2);
+});
+
+test('availability accepts the current 55-second native schema with one short request', async () => {
+  const current = plain(availabilityTool);
+  current.inputSchema.properties.wait_ms.maximum = 55000;
+  const {sdk, calls, catalogs} = fixture(() => mcp({status:'unchanged'}), [current]);
+  await sdk.workers.waitAvailable('pool');
+  assert.deepEqual(calls, [{id:'pool',name:'ssmcp.worker.wait_available',args:{wait_ms:1000}}]);
+  assert.equal(catalogs.length, 1);
 });
