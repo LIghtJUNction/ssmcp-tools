@@ -533,7 +533,8 @@
       // This read is immediate. Never extend the window with another native wait.
       const output = await execution('read', id, {job_id:job, max_bytes});
       const snapshot = output.snapshot ?? status;
-      return {...status, ...snapshot, ...output, snapshot, job_id:job};
+      // Start-only receipts describe this caller's submission. Newer job state takes precedence.
+      return {...started, ...status, ...snapshot, ...output, snapshot, job_id:job};
     } catch (error) {
       const failure = new Failure('Command started as ' + job + '; ' + (error?.message ?? text(error))
         + '. Inspect exec.status/exec.read for this job before retrying.');

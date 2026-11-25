@@ -44,6 +44,26 @@ test('exec.run does not add a wait after launch consumes the default short windo
   assert.equal(value.job_id,'job');assert.equal(value.running,true);
   assert.equal(calls.length,2);
 });
+test('a native wait preserves start-only receipts alongside the latest job state', async () => {
+  const reuse = {input_version:'tree-abc',ttl_ms:1000};
+  const {sdk,calls} = fixture((name, args) => {
+    if (name === 'ssmcp.exec.start') {
+      assert.deepEqual(plain(args), {command:['inspect'],reuse});
+      return mcp({job_id:'physical-job',running:true,reuse:{status:'joined'}});
+    }
+    assert.equal(args.job_id, 'physical-job');
+    if (name === 'ssmcp.exec.wait') return mcp({job_id:'physical-job',running:false,exit_code:0});
+    assert.equal(name, 'ssmcp.exec.read');
+    return mcp({snapshot:{job_id:'physical-job',running:false,exit_code:0},stdout:'result'});
+  });
+  const value = await sdk.exec.run('one', {command:['inspect'],reuse});
+  assert.equal(value.job_id, 'physical-job');
+  assert.equal(value.running, false);
+  assert.equal(value.exit_code, 0);
+  assert.equal(value.stdout, 'result');
+  assert.deepEqual(plain(value.reuse), {status:'joined'});
+  assert.equal(calls.length, 3);
+});
 test('parallel pending jobs keep their slots and never enter a polling loop',async()=>{
   const {sdk,calls}=fixture((name,args)=>{
     const job_id=name==='ssmcp.exec.start'?args.command[0]:args.job_id;
